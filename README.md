@@ -1,204 +1,411 @@
 # Veracode SCA Risk & Update Advisor Report
 
-Pulls actionable SCA agent-based scan data across an entire Veracode tenant and produces two views in one run: 
+Pulls actionable SCA agent-based scan data across an entire Veracode tenant and produces two reports in a single run:
 
-- Per-issue **actionable** report ranked by exploit-aware risk.
--  An **executive** rollup of the worst libraries across the whole scope. Scope is filterable by workspace and team, with severity, EPSS, exploit, and Update Advisor filters.
+* A per-issue **actionable** report ranked by exploit-aware risk, including remediation guidance, fix age, and KEV context.
+* An **executive** library rollup that identifies the highest-risk dependencies across the organization while separating ecosystems to avoid cross-language library collisions.
 
------
+Scope can be filtered by workspace, team, severity, CVSS, EPSS, exploit status, dependency type, and Update Advisor availability. Supported output formats include CSV, JSON, JSONL, SARIF, and Markdown, with built-in CI/CD gating.
 
-## How It Works
+---
+
+# How It Works
 
 For each workspace in scope, the script:
 
-1. Resolves the workspace's teams via the SCA Agent API (used for the `--team` filter and to label every row)
-1. Enumerates all projects (repos) in the workspace
-1. Pulls open `vulnerability` and `library` issues per project
-1. Extracts CVE, CVSS, EPSS, observed-exploit, reachable-vulnerable-method, severity, and the Update Advisor safe-version target for each issue
-1. Scores every issue with an explainable risk model and writes the ranked per-issue CSV
-1. Aggregates issues by library name across all repos into an executive exposure ranking
+1. Resolves workspace teams (used for `--team` filtering and report labeling; can be skipped with `--no-label-teams`).
+2. Enumerates all projects in the workspace.
+3. Retrieves open `vulnerability` and `library` issues concurrently (bounded by `--workers`).
+4. Extracts CVE, CVSS, EPSS, exploit status, reachable vulnerable method, severity, and Update Advisor remediation information.
+5. Deduplicates records where the same CVE on the same library/version/project appears as both a vulnerability and library issue.
+6. Calculates an explainable risk score for every issue.
+7. Produces an executive library exposure ranking aggregated by ecosystem and library name.
 
-All calls are read-only `GET`s against the SCA Agent API. The script never writes to the platform.
+All operations use read-only `GET` requests against the SCA Agent API. The tool never modifies data, and unit tests verify that no non-GET requests exist.
 
-> **Update Advisor data comes straight from the issues feed.** The safe upgrade target is read from `IssueSummary.library_updated_version` and `library_updated_release_date`, populated only on `issue_type=library`. No separate Update Advisor call is needed.
+> Update Advisor recommendations come directly from the issue feed using `IssueSummary.library_updated_version` and `library_updated_release_date`. No additional API calls are required.
 
------
+---
 
-## Prerequisites
+# Prerequisites
 
-Confirm the following before a run.
+* Veracode Platform **human user** API credentials (API service accounts are not supported by the SCA REST API).
+* Access to the target workspaces.
+* Network access to the appropriate regional SCA API endpoint.
+* Python 3.10 or newer.
 
-- Veracode Platform: a **human user** API credential. The SCA REST API does not accept API service accounts.
-- Veracode Platform: visibility into the workspaces you want to report on (workspace membership or team association).
-- Network: outbound access to the SCA API host for your region (see [Regions](#regions)).
+---
 
------
+# Read-Only Operation
 
-## Modes
+The tool is entirely read-only.
 
-The script is **read-only**. There is no apply mode and no confirmation prompt. Every run only reads scan results and writes local CSV and console output.
+There is no apply mode and no confirmation prompt. Every execution reads scan results and writes reports locally. `--dry-run` validates scope without retrieving issue data.
 
------
+---
 
-## Quickstart
+# Quick Start
 
 ```bash
 export VERACODE_API_KEY_ID="..."
 export VERACODE_API_KEY_SECRET="..."
 
-# Whole tenant
+# Entire tenant
 python script.py
 
-# One workspace
+# Single workspace
 python script.py --workspace "acme-dev"
 
-# One team, only what Update Advisor can fix, high severity and likelihood
-python script.py --team "Payments" --fixable-only --min-cvss 7 --min-epss 0.3
+# Multiple teams, only fixable issues, higher risk
+python script.py --team "Payments,Platform" --fixable-only --min-cvss 7 --min-epss 0.3
+
+# Fail CI if exploited vulnerabilities exist
+python script.py --exploited-only --fail-on-exploited --format sarif --out sca.sarif
+
+# Preview scope only
+python script.py --dry-run
 ```
 
-Writes two files to the current directory:
+By default, the tool creates:
 
-- `sca_actionable.csv` - one row per issue, ranked by risk
-- `sca_executive_libraries.csv` - library rollup, ranked by exposure
+* `sca_actionable.csv`
+* `sca_executive_libraries.csv`
 
------
+Both files are written with `0600` permissions and existing files are preserved unless `--force` is supplied.
 
-## Requirements
+---
+
+# Installation
 
 ```bash
-pip install requests
-pip install veracode-api-signing
+pip install -r requirements.txt
 ```
 
-Python 3.8+
+Python 3.10+ is required.
 
------
+---
 
-## Credentials
+# Authentication
 
-Uses Veracode HMAC signing. Supply credentials by environment variable or `~/.veracode/credentials`.
+Uses Veracode HMAC authentication.
 
-|Variable                    |Purpose                          |Account Type                 |
-|----------------------------|---------------------------------|-----------------------------|
-|`VERACODE_API_KEY_ID`       |Signs every SCA API request      |**Human user account**       |
-|`VERACODE_API_KEY_SECRET`   |Signs every SCA API request      |Same as above                |
+Credentials may be supplied via environment variables or `~/.veracode/credentials`.
 
-> **Human user only.** The SCA REST API rejects API service account credentials. Generate the key pair under **Veracode Platform > Account > API Credentials** on a human user with visibility into the target workspaces.
+| Variable                  | Purpose        |
+| ------------------------- | -------------- |
+| `VERACODE_API_KEY_ID`     | API key ID     |
+| `VERACODE_API_KEY_SECRET` | API key secret |
 
------
+Only **human user credentials** are supported.
 
-## Command-Line Reference
+Authentication failures immediately exit with status code **2**.
 
-### Scope
+Signed URLs, query parameters, and authentication headers are never logged.
 
-|Flag              |Default|Description                                                        |
-|------------------|-------|-------------------------------------------------------------------|
-|`--region`        |`us`   |SCA API region: `us`, `eu`, or `fed`. See [Regions](#regions).     |
-|`--workspace NAME`|-      |Restrict to a single workspace by exact name.                      |
-|`--team NAME`     |-      |Restrict to workspaces associated with this team name.             |
+---
 
-### Filters *(applied to both the actionable and executive views)*
+# Command Line Options
 
-|Flag               |Default|Description                                                       |
-|-------------------|-------|------------------------------------------------------------------|
-|`--fixable-only`   |off    |Only issues Update Advisor can fix (a safe version exists).       |
-|`--min-cvss FLOAT` |`0`    |Drop issues below this CVSS v3 score.                             |
-|`--min-epss FLOAT` |`0`    |Drop issues below this EPSS probability (0-1).                    |
-|`--exploited-only` |off    |Only vulns with an observed exploit (KEV or equivalent source).   |
+## Scope
 
-### Output
+| Flag                        | Description                             |
+| --------------------------- | --------------------------------------- |
+| `--region`                  | API region (`us`, `eu`, `fed`)          |
+| `--workspace NAME`          | Exact workspace name (case-insensitive) |
+| `--workspace-contains TEXT` | Workspace substring search              |
+| `--team NAMES`              | Comma-separated team names              |
+| `--no-label-teams`          | Skip team lookups                       |
 
-|Flag             |Default                         |Description                          |
-|-----------------|--------------------------------|-------------------------------------|
-|`--out FILE`     |`sca_actionable.csv`            |Per-issue actionable CSV path.       |
-|`--exec-out FILE`|`sca_executive_libraries.csv`   |Executive library-rollup CSV path.   |
-|`--top N`        |`25`                            |Top issues printed to console.       |
-|`--top-libs N`   |`10`                            |Top libraries printed to console.    |
+## Filters
 
-> **Filters shape both views.** The executive rollup is computed after filters run, so `--fixable-only` or `--min-cvss` narrows the top-libraries table as well as the per-issue CSV. Run with no filters for the full org-wide picture.
+Applied to both actionable and executive reports.
 
------
+| Flag                | Description                                 |
+| ------------------- | ------------------------------------------- |
+| `--fixable-only`    | Only issues with Update Advisor remediation |
+| `--min-cvss`        | Minimum CVSS score                          |
+| `--min-epss`        | Minimum EPSS probability                    |
+| `--min-severity`    | Minimum Veracode severity                   |
+| `--exploited-only`  | Only actively exploited vulnerabilities     |
+| `--direct-only`     | Only direct dependencies                    |
+| `--transitive-only` | Only transitive dependencies                |
+
+## Output
+
+| Flag              | Description                 |
+| ----------------- | --------------------------- |
+| `--out FILE`      | Actionable report output    |
+| `--exec-out FILE` | Executive report output     |
+| `--md-out FILE`   | Markdown report             |
+| `--format`        | csv, json, jsonl, or sarif  |
+| `--force`         | Overwrite existing files    |
+| `--top`           | Console issue count         |
+| `--top-libs`      | Console library count       |
+| `--group-by`      | repo, team, cve, or library |
 
 ## Risk Scoring
 
-Each issue gets an explainable 0-100 `risk_score`. Weights are defined in `compute_risk()` and are meant to be tuned.
+| Flag               | Description                  |
+| ------------------ | ---------------------------- |
+| `--w-cvss`         | CVSS weight                  |
+| `--w-epss`         | EPSS weight                  |
+| `--w-exploit`      | Exploit bonus                |
+| `--w-method`       | Reachable method bonus       |
+| `--spread-weight`  | Executive spread weighting   |
+| `--legacy-scoring` | Use previous scoring formula |
 
-|Signal                              |Contribution           |
-|------------------------------------|-----------------------|
-|CVSS v3 score (0-10)                |up to 50 (`score x 5`) |
-|EPSS probability (0-1)              |up to 30 (`score x 30`)|
-|Observed exploit (KEV etc.)         |flat +15               |
-|Reachable vulnerable method         |flat +5                |
+Active weights are displayed at runtime.
 
-The actionable CSV and the top-issues console table are sorted by this score descending.
+## CI/CD Gates
 
------
+| Flag                  | Description                              |
+| --------------------- | ---------------------------------------- |
+| `--fail-on-exploited` | Exit if exploited vulnerabilities exist  |
+| `--fail-on-risk N`    | Exit if any issue exceeds risk threshold |
+| `--fail-on-count N`   | Exit if issue count exceeds threshold    |
 
-## Executive Summary
+Exit codes:
 
-The executive rollup aggregates issues by **library name** across every repo in scope and ranks by an `exposure_score`:
+* **0** Success
+* **1** Gate threshold exceeded
+* **2** Runtime, configuration, or authentication error
+
+## Runtime
+
+| Flag                    | Description                |
+| ----------------------- | -------------------------- |
+| `--workers`             | Concurrent workers (max 8) |
+| `--retries`             | Retry count                |
+| `--retry-delay`         | Base retry delay           |
+| `--timeout`             | HTTP timeout               |
+| `--limit-projects`      | Limit projects processed   |
+| `--dry-run`             | Enumerate scope only       |
+| `--verbose` / `--quiet` | Logging controls           |
+
+Filters are applied before both reports are generated, ensuring consistent reporting.
+
+---
+
+# Risk Scoring
+
+Each issue receives an explainable 0–100 risk score.
 
 ```
-exposure_score = min( worst single-issue risk + (repos_affected - 1) x 5, 100 )
+risk =
+    cvss3 * 5
+  + sqrt(epss) * 30
+  + 15 if exploited
+  + 5 if reachable vulnerable method
+  + 2 if direct dependency and reachable method
+  + severity * 0.1
 ```
 
-This surfaces libraries that are both high-risk and widespread. Each row reports repos affected, total issues, distinct CVEs, max CVSS3, max EPSS, count of exploited issues, Update Advisor fixability (`yes` / `partial` / `no`), the safe version targets, and the versions currently in use.
+The score is capped at **100**.
 
-The console prints, in order: the executive block, a per-repo risk rollup, and the top actionable issues.
+The square root of EPSS gives greater weight to meaningful probability ranges while preserving the 0–1 scale.
 
------
+All weights are configurable.
 
-## Regions
+---
 
-|Region|Flag value|SCA API base                       |
-|------|----------|-----------------------------------|
-|US    |`us`      |`https://api.veracode.com/srcclr`  |
-|EU    |`eu`      |`https://api.veracode.eu/srcclr`   |
-|Fed   |`fed`     |`https://api.veracode.us/srcclr`   |
+# Executive Library Ranking
 
------
+Libraries are grouped by:
 
-## Output Files
+```
+(language, library name)
+```
 
-|File                            |Description                                                            |
-|--------------------------------|----------------------------------------------------------------------|
-|`sca_actionable.csv`            |One row per open issue, ranked by `risk_score`, with the Update Advisor safe version.|
-|`sca_executive_libraries.csv`   |Libraries aggregated across scope, ranked by `exposure_score`.        |
+to prevent collisions between ecosystems.
 
-### Actionable Columns
+Exposure is calculated as:
 
-`workspace`, `team`, `project`, `project_id`, `languages`, `issue_type`, `library`, `version`, `direct`, `cve`, `cvss3`, `cvss2`, `epss_score`, `epss_percentile`, `exploit_observed`, `exploit_source`, `vulnerable_method`, `severity`, `fixable`, `safe_version`, `safe_release_date`, `risk_score`
+```
+exposure_score =
+min(
+    highest_issue_risk +
+    spread_weight × log2(repositories_affected),
+    100
+)
+```
 
-### Executive Columns
+Each library includes:
 
-`library`, `repos_affected`, `issues`, `distinct_cves`, `max_cvss3`, `max_epss`, `exploited_issues`, `fixable_issues`, `fully_fixable`, `safe_versions`, `versions_in_use`, `exposure_score`
+* repositories affected
+* total issues
+* distinct CVEs
+* maximum CVSS
+* maximum EPSS
+* exploited issue count
+* KEV issue count
+* fixability (`yes`, `partial`, `no`)
+* safe versions
+* versions in use
+* language
 
-`fully_fixable` values: `yes` (every issue has a safe version), `partial` (some do), `no` (none).
+Console output includes:
 
------
+1. Executive summary
+2. Grouped rollup
+3. Top actionable issues
 
-## API Endpoints Used
+---
 
-|Operation           |Method and path                                                  |
-|--------------------|-----------------------------------------------------------------|
-|List workspaces     |`GET /v3/workspaces`                                             |
-|List workspace teams|`GET /v3/workspaces/{id}/teams`                                 |
-|List projects       |`GET /v3/workspaces/{id}/projects`                             |
-|List project issues |`GET /v3/workspaces/{id}/projects/{projectId}/issues`         |
+# Regions
 
-All responses are HAL-paginated; the script walks every page and extracts the embedded collection regardless of its key name.
+| Region  | Flag  |
+| ------- | ----- |
+| US      | `us`  |
+| EU      | `eu`  |
+| Federal | `fed` |
 
------
+Only supported Veracode endpoints are allowed.
 
-## Notes
+---
 
-- Both `vulnerability` and `library` issue types are pulled, so Update Advisor bumps are captured even where there is no active CVE.
-- The executive rollup keys on library name, not name plus version. It answers "which components are our biggest org-wide problem." Versions in use are shown as a column.
-- Team filtering resolves teams per workspace because the workspaces endpoint has no team filter and the Workspace object does not embed teams.
-- `429` responses are retried with backoff.
+# Output Files
 
------
+| File                          | Description                                 |
+| ----------------------------- | ------------------------------------------- |
+| `sca_actionable.csv`          | One row per issue ranked by risk            |
+| `sca_executive_libraries.csv` | Library exposure summary                    |
+| Markdown report               | Executive summary and remediation metrics   |
+| SARIF                         | SARIF 2.1.0 output for GitHub code scanning |
 
-## Support
+Files are written atomically using temporary files and renamed only after successful completion.
 
-Supplied as a community tool. Not officially supported by Veracode. For issues, provide the command used, the region, and a redacted sample of the failing API response.
+Existing files require `--force`.
+
+## Actionable Report Columns
+
+```
+workspace
+team
+project
+project_id
+languages
+issue_type
+library
+version
+direct
+cve
+cvss3
+cvss2
+epss_score
+epss_percentile
+exploit_observed
+exploit_source
+vulnerable_method
+severity
+fixable
+safe_version
+safe_release_date
+risk_score
+remediation
+fix_age_days
+kev
+language
+```
+
+## Executive Report Columns
+
+```
+library
+language
+repos_affected
+issues
+distinct_cves
+max_cvss3
+max_epss
+exploited_issues
+kev_issues
+fixable_issues
+fully_fixable
+safe_versions
+versions_in_use
+exposure_score
+```
+
+`fully_fixable` values:
+
+* yes
+* partial
+* no
+
+## CSV Injection Protection
+
+Any value beginning with:
+
+```
+=
++
+-
+@
+TAB
+CR
+```
+
+is prefixed with a single quote before being written, preventing spreadsheet formula execution.
+
+---
+
+# API Endpoints
+
+| Operation          | Endpoint                                              |
+| ------------------ | ----------------------------------------------------- |
+| List workspaces    | `GET /v3/workspaces`                                  |
+| Workspace teams    | `GET /v3/workspaces/{id}/teams`                       |
+| Workspace projects | `GET /v3/workspaces/{id}/projects`                    |
+| Project issues     | `GET /v3/workspaces/{id}/projects/{projectId}/issues` |
+
+All HAL pagination is handled automatically.
+
+---
+
+# Concurrency
+
+Issue retrieval uses up to eight worker threads.
+
+Each worker maintains its own pooled HTTP session and HMAC signer.
+
+A shared throttling mechanism honors server rate limiting and `Retry-After` headers.
+
+Output remains deterministic regardless of worker count.
+
+Requests include a `veracode-sca-risk-report/<version>` User-Agent.
+
+---
+
+# Troubleshooting
+
+| Problem                | Resolution                                                 |
+| ---------------------- | ---------------------------------------------------------- |
+| HTTP 401               | Use human user credentials instead of API service accounts |
+| HTTP 403               | Verify workspace access                                    |
+| No matching workspaces | Check region or workspace name                             |
+| Empty reports          | Relax filters                                              |
+| Existing file error    | Use `--force`                                              |
+| Frequent rate limiting | Reduce `--workers` or increase retry delay                 |
+
+---
+
+# Notes
+
+* Both `vulnerability` and `library` issue types are processed so Update Advisor recommendations are captured even when no CVE exists.
+* Duplicate vulnerability/library records are merged while preserving the richest available information.
+* Team filtering requires workspace team lookups because the workspace API does not expose team membership.
+* Library language is determined from ecosystem metadata with project language as a fallback.
+
+---
+
+# Support
+
+This is a community-maintained tool and is not officially supported by Veracode.
+
+When reporting issues, include:
+
+* command used
+* region
+* redacted API response
+
+The tool never logs signed headers or query strings.
