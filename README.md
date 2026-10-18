@@ -36,14 +36,6 @@ All operations use read-only `GET` requests against the SCA Agent API. The tool 
 
 ---
 
-# Read-Only Operation
-
-The tool is entirely read-only.
-
-There is no apply mode and no confirmation prompt. Every execution reads scan results and writes reports locally. `--dry-run` validates scope without retrieving issue data.
-
----
-
 # Quick Start
 
 ```bash
